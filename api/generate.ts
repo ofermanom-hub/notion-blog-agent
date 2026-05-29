@@ -1,11 +1,15 @@
 import Anthropic from "@anthropic-ai/sdk";
+import { BRANDS, buildSystemPrompt, isBrandId, type BrandId } from "./brands";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
-type GenType = "headlines" | "intro" | "topics";
+type GenType = "headlines" | "intro" | "topics" | "draft";
 
 interface RequestBody {
   topic?: string;
   type?: GenType;
+  brand?: BrandId;
+  single?: boolean; // regenerate one list item
+  avoid?: string; // the item being replaced, to vary against
 }
 
 interface VercelRequest {
@@ -19,32 +23,45 @@ interface VercelResponse {
   setHeader: (key: string, value: string) => void;
 }
 
-// ─── Brand voice + prompts ────────────────────────────────────────────────────
-const SYSTEM_PROMPT = `You are the in-house blog content agent for Notion (notion.so).
-Notion is the connected workspace for docs, wikis, projects, and notes — and increasingly an AI-native tool.
+const VALID_TYPES: ReadonlyArray<GenType> = ["headlines", "intro", "topics", "draft"];
 
-VOICE & STYLE:
-- Calm, clear, human. Notion writes like a thoughtful person, not a marketing department.
-- Plain language over jargon. Short sentences. Confident but never hype-y. No exclamation marks, no "revolutionize," no "unleash."
-- Practical and grounded — focused on how people actually work and the small frictions of work life.
-- Lightly warm, occasionally a touch of dry wit. Lowercase is fine in product, but blog content uses sentence case.
-- Themes Notion owns: taming tool sprawl, building a second brain, team docs/wikis, going from chaos to clarity, AI inside your workspace.
-Never mention competitors by name. Never overpromise.`;
+function buildPrompt(type: GenType, topic: string, brandName: string, opts: { single: boolean; avoid: string }): string {
+  const t = topic || `a topic of your choice that fits ${brandName}`;
 
-function buildPrompt(type: GenType, topic: string): string {
-  const t = topic || "a topic of your choice that fits Notion";
-  if (type === "headlines") {
-    return `Write 5 blog post headlines for Notion about: "${t}".
-Vary the angle (how-to, contrarian, story-driven, listicle, question).
+  if (type === "headlines" || type === "topics") {
+    const noun = type === "headlines" ? "blog post headlines" : "blog post topic ideas";
+    if (opts.single) {
+      return `Write 1 alternative ${type === "headlines" ? "blog post headline" : "blog post topic idea"} for ${brandName} about: "${t}".
+It must be clearly different in angle from this one: "${opts.avoid}".
+Return ONLY a JSON array containing a single string. No preamble, no markdown.`;
+    }
+    const extra =
+      type === "headlines"
+        ? "Vary the angle (how-to, contrarian, story-driven, listicle, question)."
+        : "Each should be a short, specific angle worth a full post.";
+    return `Write 5 ${noun} for ${brandName} about: "${t}".
+${extra}
 Return ONLY a JSON array of 5 strings. No preamble, no markdown.`;
   }
-  if (type === "topics") {
-    return `Suggest 5 blog post topic ideas for Notion related to: "${t}".
-Each should be a short, specific angle worth a full post.
-Return ONLY a JSON array of 5 strings. No preamble, no markdown.`;
+
+  if (type === "draft") {
+    return `Write a complete short blog post for ${brandName} about: "${t}".
+Then produce SEO metadata for it.
+Return ONLY a JSON object, no markdown, with this exact shape:
+{
+  "headline": string,
+  "body": string[],            // 4-6 paragraphs, each a string
+  "metaDescription": string,   // <= 155 characters, compelling, on-brand
+  "internalLinks": [           // exactly 3 suggested internal links
+    { "anchor": string, "target": string }  // target is a slug like "/blog/some-post"
+  ]
+}
+No preamble, no markdown fences.`;
   }
-  return `Write the opening paragraph (the intro) of a Notion blog post about: "${t}".
-3–5 sentences. Hook the reader with a real, relatable work moment, then point toward the idea.
+
+  // intro
+  return `Write the opening paragraph (the intro) of a ${brandName} blog post about: "${t}".
+3-5 sentences. Hook the reader with a real, relatable moment, then point toward the idea.
 Return ONLY a JSON object: {"headline": string, "intro": string}. No markdown, no preamble.`;
 }
 
@@ -64,20 +81,30 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
   const body: RequestBody = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
   const type: GenType = body.type ?? "headlines";
   const topic: string = (body.topic ?? "").trim();
+  const brandId: BrandId = isBrandId(body.brand) ? body.brand : "notion";
+  const single = Boolean(body.single);
+  const avoid = (body.avoid ?? "").trim();
 
-  if (!["headlines", "intro", "topics"].includes(type)) {
+  if (!VALID_TYPES.includes(type)) {
     res.status(400).json({ ok: false, error: "Invalid type" });
     return;
   }
 
+  const brand = BRANDS[brandId];
   const client = new Anthropic({ apiKey });
 
   try {
     const message = await client.messages.create({
       model: "claude-sonnet-4-6",
-      max_tokens: 1000,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: "user", content: buildPrompt(type, topic) }],
+      max_tokens: 1500,
+      system: [
+        {
+          type: "text",
+          text: buildSystemPrompt(brand),
+          cache_control: { type: "ephemeral" },
+        },
+      ],
+      messages: [{ role: "user", content: buildPrompt(type, topic, brand.name, { single, avoid }) }],
     });
 
     const text = message.content
