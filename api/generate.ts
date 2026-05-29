@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { BRANDS, buildSystemPrompt, isBrandId, type BrandId } from "./brands";
+import { BRANDS, buildSystemPrompt, isBrandId, type BrandId } from "./brands.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 type GenType = "headlines" | "intro" | "topics" | "draft";
